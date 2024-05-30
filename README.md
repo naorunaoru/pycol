@@ -1,6 +1,6 @@
 # пукол
 
-A simple script utilizing python and opencv to automatically process scanned negatives. It does:
+A simple script utilizing python, opencv, and scikit-image to automatically process scanned negatives. It does:
 
 - cropping
 - inversion

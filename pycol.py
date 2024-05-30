@@ -3,6 +3,7 @@ import numpy as np
 import glob
 import os
 import sys
+from skimage import exposure
 
 def read_image(file_path):
     with open(file_path, 'rb') as f:
@@ -18,7 +19,6 @@ def decode_image(buffer):
     return img
 
 def crop_image(img):
-
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape
 
@@ -43,7 +43,6 @@ def crop_image(img):
 
         return start, end
 
-    
     top_start, _ = find_dark_border(gray[:height // 2, :])
     bottom_start, bottom_end = find_dark_border(gray[height // 2:, :], axis=0)
     bottom_start += height // 2
@@ -54,71 +53,76 @@ def crop_image(img):
     right_start += width // 2
     right_end += width // 2
 
-    
     top_crop = max(0, top_start)
     bottom_crop = min(height, bottom_end)
     left_crop = max(0, left_start)
     right_crop = min(width, right_end)
-
     
     cropped_img = img[top_crop:bottom_crop, left_crop:right_crop]
 
     return cropped_img
 
 def invert_image(img):
-    
     inverted_img = cv2.bitwise_not(img)
     return inverted_img
 
-def adjust_colors(img):
-    img_32f = img.astype(np.float32) / 65535.0
+def rescale_histogram(img):
+    lower_bound = np.percentile(img, 0.05)
+    upper_bound = np.percentile(img, 99.95)
+    
+    img_clipped = np.clip(img, lower_bound, upper_bound)
+    
+    clipped_min = np.min(img_clipped)
+    clipped_max = np.max(img_clipped)
+    
+    rescaled_img = exposure.rescale_intensity(img_clipped, in_range=(clipped_min, clipped_max))
+    
+    rescaled_img = (rescaled_img * 255).astype(img.dtype) if rescaled_img.dtype == np.float64 else rescaled_img
+    
+    return rescaled_img
 
-    clahe = cv2.createCLAHE(clipLimit=16.0, tileGridSize=(8, 8))
+def apply_adaptive_histogram_equalization(img):
+    return exposure.equalize_adapthist(img, kernel_size=128, clip_limit=0.001)
 
-    lab = cv2.cvtColor(img_32f, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    l_u16 = cv2.normalize(l, None, 0, 65535, cv2.NORM_MINMAX, cv2.CV_16U)
-
-    cl_32f = cv2.normalize(clahe.apply(l_u16), None, 0, 100.0, cv2.NORM_MINMAX, cv2.CV_32F)
-
-    adjusted_img = cv2.cvtColor(cv2.merge((cl_32f, a, b)), cv2.COLOR_LAB2BGR)
-
-    return cv2.normalize(adjusted_img, None, 0, 65535, cv2.NORM_MINMAX, cv2.CV_16U)
-
-def apply_wb(image, p=6):
+def correct_wb(image: np.ndarray) -> np.ndarray:
     image_float = image.astype(np.float32)
+    
+    height, width, _ = image.shape
 
-    R, G, B = cv2.split(image_float)
+    x1, x2 = int(0.05 * width), int(0.95 * width)
+    y1, y2 = int(0.05 * height), int(0.95 * height)
 
-    R_p = np.power(R, p)
-    G_p = np.power(G, p)
-    B_p = np.power(B, p)
+    central_region = image_float[y1:y2, x1:x2]
 
-    R_mean = np.power(np.mean(R_p), 1.0/p)
-    G_mean = np.power(np.mean(G_p), 1.0/p)
-    B_mean = np.power(np.mean(B_p), 1.0/p)
+    max_r = np.max(central_region[:, :, 0])
+    max_g = np.max(central_region[:, :, 1])
+    max_b = np.max(central_region[:, :, 2])
 
-    Kr = (R_mean + G_mean + B_mean) / (3 * R_mean)
-    Kg = (R_mean + G_mean + B_mean) / (3 * G_mean)
-    Kb = (R_mean + G_mean + B_mean) / (3 * B_mean)
+    image_float[:, :, 0] = image_float[:, :, 0] / max_r
+    image_float[:, :, 1] = image_float[:, :, 1] / max_g
+    image_float[:, :, 2] = image_float[:, :, 2] / max_b
 
-    R = R * Kr
-    G = G * Kg
-    B = B * Kb
+    if image.dtype == np.uint16:
+        image_float = np.clip(image_float * 65535, 0, 65535)
+    else:
+        image_float = np.clip(image_float * 255, 0, 255)
 
-    white_balanced_float = cv2.merge([R, G, B])
+    corrected_image = image_float.astype(image.dtype)
 
-    white_balanced = np.clip(white_balanced_float, 0, 65535).astype(np.uint16)
-
-    return white_balanced
+    return corrected_image
 
 def encode_image(img, file_extension):
-    image_scaled = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+    if file_extension.lower() in ['.png', '.tiff', '.tif']:
+        image_scaled = cv2.normalize(img, None, 0, 65535, cv2.NORM_MINMAX)
+        image_uint16 = image_scaled.astype(np.uint16)
+        
+        success, buffer = cv2.imencode(file_extension, image_uint16)
+    else:
+        image_scaled = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+        image_uint8 = image_scaled.astype(np.uint8)
+        
+        success, buffer = cv2.imencode(file_extension, image_uint8)
     
-    image_uint8 = image_scaled.astype(np.uint8)
-    
-    success, buffer = cv2.imencode(file_extension, image_uint8)
     if not success:
         raise IOError("Error encoding image")
     return buffer
@@ -134,9 +138,10 @@ def process_image(file_path, output_dir=None, output_extension=None):
 
     processing_stages = [
         crop_image,
+        correct_wb,
         invert_image,
-        adjust_colors,
-        # apply_wb
+        rescale_histogram,
+        # apply_adaptive_histogram_equalization,
     ]
 
     for stage in processing_stages:
